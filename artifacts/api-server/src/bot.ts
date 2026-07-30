@@ -3,11 +3,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { logger } from "./lib/logger";
 
-// Channel where bot IS admin — verified via getChatMember
-const CHANNEL_ADMIN = "@PWXCHATON";
-
-// Channel where bot CANNOT be admin — verified via forwarded message
-const CHANNEL_FORWARD = "pwxonrender"; // lowercase, no @
+// Both channels — bot is admin in both, verified via getChatMember
+const CHANNEL_PWXCHATON = "@PWXCHATON";
+const CHANNEL_PWXRENDER = "@pwxonrender";
 
 // __dirname equivalent in ESM
 const __filename = fileURLToPath(import.meta.url);
@@ -76,103 +74,87 @@ export function createBot(token: string): Telegraf {
       Markup.button.url("📢 Join @pwxonrender", "https://t.me/pwxonrender"),
       Markup.button.url("📢 Join @PWXCHATON", "https://t.me/PWXCHATON"),
     ],
-    [Markup.button.callback("✅ Check @PWXCHATON membership", "check_pwxchaton")],
+    [Markup.button.callback("✅ I've Joined Both — Send Files", "check_both")],
   ]);
 
   bot.start(async (ctx) => {
     userState.delete(ctx.from.id);
     await ctx.reply(
-      `👋 *Welcome!*\n\n` +
+      `👋 *Welcome to PWX Bot!*\n\n` +
         `To receive the files, join *both* channels:\n\n` +
         `📢 [pwxonrender](https://t.me/pwxonrender)\n` +
         `📢 [PWXCHATON](https://t.me/PWXCHATON)\n\n` +
-        `Then follow the 2-step verification below.`,
+        `After joining, press the button below.`,
       { parse_mode: "Markdown", ...startKeyboard },
     );
   });
 
-  // Step 1 — verify @PWXCHATON via getChatMember (bot is admin there)
-  bot.action("check_pwxchaton", async (ctx) => {
+  // Single button — verify both channels at once
+  bot.action("check_both", async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;
-    await ctx.answerCbQuery("Checking @PWXCHATON…");
+    await ctx.answerCbQuery("Checking membership…");
 
-    const inChat = await isChatMember(bot, userId, CHANNEL_ADMIN);
-    if (!inChat) {
+    const [inPwxchat, inPwxrender] = await Promise.all([
+      isChatMember(bot, userId, CHANNEL_PWXCHATON),
+      isChatMember(bot, userId, CHANNEL_PWXRENDER),
+    ]);
+
+    if (!inPwxchat && !inPwxrender) {
       await ctx.reply(
-        `❌ You haven't joined *@PWXCHATON* yet.\n\nJoin and try again.`,
+        `❌ You haven't joined *either* channel yet.\n\nJoin both and try again.`,
         {
           parse_mode: "Markdown",
           ...Markup.inlineKeyboard([
-            [Markup.button.url("📢 Join @PWXCHATON", "https://t.me/PWXCHATON")],
-            [Markup.button.callback("🔄 Try again", "check_pwxchaton")],
+            [
+              Markup.button.url("📢 Join @pwxonrender", "https://t.me/pwxonrender"),
+              Markup.button.url("📢 Join @PWXCHATON", "https://t.me/PWXCHATON"),
+            ],
+            [Markup.button.callback("🔄 Try Again", "check_both")],
           ]),
         },
       );
       return;
     }
 
-    getState(userId).pwxchatVerified = true;
-
-    if (getState(userId).pwxrenderVerified) {
-      await sendFiles(ctx);
+    if (!inPwxchat) {
+      await ctx.reply(
+        `❌ You haven't joined *@PWXCHATON* yet.\n\nJoin and try again.`,
+        {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.url("📢 Join @PWXCHATON", "https://t.me/PWXCHATON")],
+            [Markup.button.callback("🔄 Try Again", "check_both")],
+          ]),
+        },
+      );
       return;
     }
 
-    // Step 2 — verify @pwxonrender via forwarded message
-    await ctx.reply(
-      `✅ *@PWXCHATON verified!*\n\n` +
-        `Now verify *@pwxonrender*:\n\n` +
-        `1. Open the [@pwxonrender](https://t.me/pwxonrender) channel\n` +
-        `2. Tap any message → *Forward*\n` +
-        `3. Forward it *to this bot chat* (here)\n\n` +
-        `The bot will detect it automatically ✨`,
-      { parse_mode: "Markdown" },
-    );
+    if (!inPwxrender) {
+      await ctx.reply(
+        `❌ You haven't joined *@pwxonrender* yet.\n\nJoin and try again.`,
+        {
+          parse_mode: "Markdown",
+          ...Markup.inlineKeyboard([
+            [Markup.button.url("📢 Join @pwxonrender", "https://t.me/pwxonrender")],
+            [Markup.button.callback("🔄 Try Again", "check_both")],
+          ]),
+        },
+      );
+      return;
+    }
+
+    // Both verified
+    getState(userId).pwxchatVerified = true;
+    getState(userId).pwxrenderVerified = true;
+    await sendFiles(ctx);
   });
 
-  // Step 2 — detect forwarded message from @pwxonrender
+  // Catch stray messages
   bot.on("message", async (ctx) => {
-    const msg = ctx.message;
     const userId = ctx.from?.id;
     if (!userId) return;
-
-    // Detect forward origin (Telegram API v6+ uses forward_origin, older uses forward_from_chat)
-    type ForwardChat = { username?: string };
-    type ForwardOrigin = { type?: string; chat?: ForwardChat };
-
-    const fwdChat = "forward_from_chat" in msg
-      ? (msg.forward_from_chat as ForwardChat | undefined)
-      : undefined;
-    const fwdOrigin = "forward_origin" in msg
-      ? (msg.forward_origin as ForwardOrigin | undefined)
-      : undefined;
-
-    const forwardedUsername =
-      fwdChat?.username?.toLowerCase() ??
-      (fwdOrigin?.type === "channel" ? fwdOrigin?.chat?.username?.toLowerCase() : undefined);
-
-    if (forwardedUsername === CHANNEL_FORWARD) {
-      getState(userId).pwxrenderVerified = true;
-
-      if (getState(userId).pwxchatVerified) {
-        await sendFiles(ctx);
-      } else {
-        await ctx.reply(
-          `✅ *@pwxonrender verified!*\n\n` +
-            `Now verify *@PWXCHATON* by pressing the button below.`,
-          {
-            parse_mode: "Markdown",
-            ...Markup.inlineKeyboard([
-              [Markup.button.callback("✅ Check @PWXCHATON membership", "check_pwxchaton")],
-            ]),
-          },
-        );
-      }
-      return;
-    }
-
-    // Guide user if not yet verified
     const state = getState(userId);
     if (!state.pwxchatVerified || !state.pwxrenderVerified) {
       await ctx.reply("Use /start to begin the verification process.");
@@ -182,7 +164,7 @@ export function createBot(token: string): Telegraf {
   // /checkbot — debug admin status
   bot.command("checkbot", async (ctx) => {
     const results: string[] = [`*ZIP path:* \`${ZIP_FILE}\``];
-    for (const channel of [CHANNEL_ADMIN, `@${CHANNEL_FORWARD}`]) {
+    for (const channel of [CHANNEL_PWXCHATON, CHANNEL_PWXRENDER]) {
       try {
         const me = await bot.telegram.getChatMember(channel, ctx.botInfo.id);
         results.push(`${channel}: bot status = *${me.status}*`);
