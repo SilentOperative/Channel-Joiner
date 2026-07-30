@@ -1,154 +1,197 @@
-import { Telegraf, Markup } from "telegraf";
+import { Telegraf, Markup, type Context } from "telegraf";
 import path from "path";
+import { fileURLToPath } from "url";
 import { logger } from "./lib/logger";
 
-const CHANNEL_1 = "@pwxonrender";
-const CHANNEL_2 = "@PWXCHATON";
+// Channel where bot IS admin — verified via getChatMember
+const CHANNEL_ADMIN = "@PWXCHATON";
 
-const ZIP_FILE = path.resolve(process.cwd(), "attached_assets/pwx-ads-skipper_1785406063000.zip");
+// Channel where bot CANNOT be admin — verified via forwarded message
+const CHANNEL_FORWARD = "pwxonrender"; // lowercase, no @
+
+// __dirname equivalent in ESM
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Go up from artifacts/api-server/dist/ → workspace root → attached_assets
+const WORKSPACE_ROOT = path.resolve(__dirname, "../../../");
+const ZIP_FILE = path.join(WORKSPACE_ROOT, "attached_assets/pwx-ads-skipper_1785406063000.zip");
 const APK_LINK = "https://github.com/kiwibrowser/src.next/releases/tag/14310011181";
 
-type MemberStatus = "member" | "not_member" | "bot_not_admin";
+// Per-user verification state (in-memory)
+interface UserState {
+  pwxchatVerified: boolean;
+  pwxrenderVerified: boolean;
+}
+const userState = new Map<number, UserState>();
 
-async function checkMembership(
-  bot: Telegraf,
-  userId: number,
-  channel: string,
-): Promise<MemberStatus> {
+function getState(userId: number): UserState {
+  if (!userState.has(userId)) {
+    userState.set(userId, { pwxchatVerified: false, pwxrenderVerified: false });
+  }
+  return userState.get(userId)!;
+}
+
+async function isChatMember(bot: Telegraf, userId: number, channel: string): Promise<boolean> {
   try {
     const member = await bot.telegram.getChatMember(channel, userId);
     logger.info({ channel, userId, status: member.status }, "getChatMember result");
-    if (["member", "administrator", "creator"].includes(member.status)) {
-      return "member";
-    }
-    return "not_member";
+    return ["member", "administrator", "creator"].includes(member.status);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.warn({ channel, userId, err: msg }, "getChatMember error");
-
-    // Telegram returns these when the bot lacks admin rights in the channel
-    if (
-      msg.includes("administrator") ||
-      msg.includes("not enough rights") ||
-      msg.includes("CHAT_ADMIN_REQUIRED") ||
-      msg.includes("bot is not a member") ||
-      msg.includes("Forbidden")
-    ) {
-      return "bot_not_admin";
-    }
-
-    // "user not found" → user has not joined
-    return "not_member";
+    logger.warn({ channel, userId, err: msg }, "getChatMember failed");
+    return false;
   }
+}
+
+async function sendFiles(ctx: Context): Promise<void> {
+  await ctx.reply("✅ *Both channels verified!* Sending your files now…", {
+    parse_mode: "Markdown",
+  });
+
+  try {
+    await ctx.replyWithDocument(
+      { source: ZIP_FILE, filename: "pwx-ads-skipper.zip" },
+      { caption: "📦 *PWX Ads Skipper*", parse_mode: "Markdown" },
+    );
+  } catch (err) {
+    logger.error({ err, ZIP_FILE }, "Failed to send ZIP file");
+    await ctx.reply("⚠️ Could not send the ZIP file. Please try again later.");
+  }
+
+  await ctx.reply(
+    `📱 *Kiwi Browser APK*\n\n` +
+      `Download from the official GitHub release:\n` +
+      `👉 ${APK_LINK}\n\n` +
+      `Tap the link, then download the \`.apk\` from the Assets section.`,
+    { parse_mode: "Markdown" },
+  );
 }
 
 export function createBot(token: string): Telegraf {
   const bot = new Telegraf(token);
 
-  const joinKeyboard = Markup.inlineKeyboard([
+  const startKeyboard = Markup.inlineKeyboard([
     [
       Markup.button.url("📢 Join @pwxonrender", "https://t.me/pwxonrender"),
       Markup.button.url("📢 Join @PWXCHATON", "https://t.me/PWXCHATON"),
     ],
-    [Markup.button.callback("✅ I've Joined Both — Send Files", "check_membership")],
+    [Markup.button.callback("✅ Check @PWXCHATON membership", "check_pwxchaton")],
   ]);
 
   bot.start(async (ctx) => {
+    userState.delete(ctx.from.id);
     await ctx.reply(
       `👋 *Welcome!*\n\n` +
-        `To receive the files, you must join *both* channels below:\n\n` +
+        `To receive the files, join *both* channels:\n\n` +
         `📢 [pwxonrender](https://t.me/pwxonrender)\n` +
         `📢 [PWXCHATON](https://t.me/PWXCHATON)\n\n` +
-        `After joining, tap the button below to verify and get your files.`,
-      {
-        parse_mode: "Markdown",
-        ...joinKeyboard,
-      },
+        `Then follow the 2-step verification below.`,
+      { parse_mode: "Markdown", ...startKeyboard },
     );
   });
 
-  // /checkbot command — lets the owner verify the bot has admin rights
-  bot.command("checkbot", async (ctx) => {
-    const results: string[] = [];
-    for (const channel of [CHANNEL_1, CHANNEL_2]) {
-      try {
-        const me = await bot.telegram.getChatMember(channel, ctx.botInfo.id);
-        results.push(`${channel}: bot status = *${me.status}*`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        results.push(`${channel}: ❌ error — ${msg}`);
-      }
-    }
-    await ctx.reply(results.join("\n"), { parse_mode: "Markdown" });
-  });
-
-  bot.action("check_membership", async (ctx) => {
+  // Step 1 — verify @PWXCHATON via getChatMember (bot is admin there)
+  bot.action("check_pwxchaton", async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId) return;
+    await ctx.answerCbQuery("Checking @PWXCHATON…");
 
-    await ctx.answerCbQuery("Checking your membership…");
-
-    const [status1, status2] = await Promise.all([
-      checkMembership(bot, userId, CHANNEL_1),
-      checkMembership(bot, userId, CHANNEL_2),
-    ]);
-
-    // Bot is not admin in at least one channel — inform the channel owner
-    if (status1 === "bot_not_admin" || status2 === "bot_not_admin") {
-      const notAdmin: string[] = [];
-      if (status1 === "bot_not_admin") notAdmin.push(CHANNEL_1);
-      if (status2 === "bot_not_admin") notAdmin.push(CHANNEL_2);
+    const inChat = await isChatMember(bot, userId, CHANNEL_ADMIN);
+    if (!inChat) {
       await ctx.reply(
-        `⚙️ *Bot setup required*\n\n` +
-          `The bot needs to be an *Administrator* in:\n${notAdmin.map((c) => `• ${c}`).join("\n")}\n\n` +
-          `Ask the channel owner to:\n` +
-          `1. Open the channel → Manage → Administrators\n` +
-          `2. Add *@pwxonrenderbot* as administrator\n` +
-          `3. Try again after that.`,
-        { parse_mode: "Markdown" },
-      );
-      return;
-    }
-
-    if (status1 !== "member" || status2 !== "member") {
-      const missing: string[] = [];
-      if (status1 !== "member") missing.push(`📢 [pwxonrender](https://t.me/pwxonrender)`);
-      if (status2 !== "member") missing.push(`📢 [PWXCHATON](https://t.me/PWXCHATON)`);
-
-      await ctx.reply(
-        `❌ You haven't joined all required channels yet.\n\n` +
-          `Please join:\n${missing.join("\n")}\n\n` +
-          `Then press the button again.`,
+        `❌ You haven't joined *@PWXCHATON* yet.\n\nJoin and try again.`,
         {
           parse_mode: "Markdown",
-          ...joinKeyboard,
+          ...Markup.inlineKeyboard([
+            [Markup.button.url("📢 Join @PWXCHATON", "https://t.me/PWXCHATON")],
+            [Markup.button.callback("🔄 Try again", "check_pwxchaton")],
+          ]),
         },
       );
       return;
     }
 
-    // Both channels joined ✅
-    await ctx.reply("✅ *Membership verified!* Sending your files now…", { parse_mode: "Markdown" });
+    getState(userId).pwxchatVerified = true;
 
-    // 1. Send ZIP directly (212 KB)
-    try {
-      await ctx.replyWithDocument(
-        { source: ZIP_FILE, filename: "pwx-ads-skipper.zip" },
-        { caption: "📦 *PWX Ads Skipper*", parse_mode: "Markdown" },
-      );
-    } catch (err) {
-      logger.error({ err }, "Failed to send ZIP file");
-      await ctx.reply("⚠️ Could not send the ZIP file. Please try again later.");
+    if (getState(userId).pwxrenderVerified) {
+      await sendFiles(ctx);
+      return;
     }
 
-    // 2. Send Kiwi Browser APK link
+    // Step 2 — verify @pwxonrender via forwarded message
     await ctx.reply(
-      `📱 *Kiwi Browser APK*\n\n` +
-        `Download from the official GitHub release:\n` +
-        `👉 ${APK_LINK}\n\n` +
-        `Tap the link, then download the \`.apk\` from the Assets section.`,
+      `✅ *@PWXCHATON verified!*\n\n` +
+        `Now verify *@pwxonrender*:\n\n` +
+        `1. Open the [@pwxonrender](https://t.me/pwxonrender) channel\n` +
+        `2. Tap any message → *Forward*\n` +
+        `3. Forward it *to this bot chat* (here)\n\n` +
+        `The bot will detect it automatically ✨`,
       { parse_mode: "Markdown" },
     );
+  });
+
+  // Step 2 — detect forwarded message from @pwxonrender
+  bot.on("message", async (ctx) => {
+    const msg = ctx.message;
+    const userId = ctx.from?.id;
+    if (!userId) return;
+
+    // Detect forward origin (Telegram API v6+ uses forward_origin, older uses forward_from_chat)
+    type ForwardChat = { username?: string };
+    type ForwardOrigin = { type?: string; chat?: ForwardChat };
+
+    const fwdChat = "forward_from_chat" in msg
+      ? (msg.forward_from_chat as ForwardChat | undefined)
+      : undefined;
+    const fwdOrigin = "forward_origin" in msg
+      ? (msg.forward_origin as ForwardOrigin | undefined)
+      : undefined;
+
+    const forwardedUsername =
+      fwdChat?.username?.toLowerCase() ??
+      (fwdOrigin?.type === "channel" ? fwdOrigin?.chat?.username?.toLowerCase() : undefined);
+
+    if (forwardedUsername === CHANNEL_FORWARD) {
+      getState(userId).pwxrenderVerified = true;
+
+      if (getState(userId).pwxchatVerified) {
+        await sendFiles(ctx);
+      } else {
+        await ctx.reply(
+          `✅ *@pwxonrender verified!*\n\n` +
+            `Now verify *@PWXCHATON* by pressing the button below.`,
+          {
+            parse_mode: "Markdown",
+            ...Markup.inlineKeyboard([
+              [Markup.button.callback("✅ Check @PWXCHATON membership", "check_pwxchaton")],
+            ]),
+          },
+        );
+      }
+      return;
+    }
+
+    // Guide user if not yet verified
+    const state = getState(userId);
+    if (!state.pwxchatVerified || !state.pwxrenderVerified) {
+      await ctx.reply("Use /start to begin the verification process.");
+    }
+  });
+
+  // /checkbot — debug admin status
+  bot.command("checkbot", async (ctx) => {
+    const results: string[] = [`*ZIP path:* \`${ZIP_FILE}\``];
+    for (const channel of [CHANNEL_ADMIN, `@${CHANNEL_FORWARD}`]) {
+      try {
+        const me = await bot.telegram.getChatMember(channel, ctx.botInfo.id);
+        results.push(`${channel}: bot status = *${me.status}*`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        results.push(`${channel}: ❌ ${msg}`);
+      }
+    }
+    await ctx.reply(results.join("\n"), { parse_mode: "Markdown" });
   });
 
   bot.catch((err) => {
