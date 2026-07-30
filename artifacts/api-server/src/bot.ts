@@ -77,6 +77,14 @@ export function createBot(token: string): Telegraf {
     [Markup.button.callback("✅ I've Joined Both — Send Files", "check_both")],
   ]);
 
+  // Only respond in private chats
+  const privateOnly = async (ctx: Context, next: () => Promise<void>) => {
+    if (ctx.chat?.type !== "private") return;
+    return next();
+  };
+
+  bot.use(privateOnly);
+
   bot.start(async (ctx) => {
     userState.delete(ctx.from.id);
     await ctx.reply(
